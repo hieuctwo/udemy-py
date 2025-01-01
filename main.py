@@ -23,6 +23,7 @@ from utils.process_captions import download_captions
 from utils.process_assets import download_supplementary_assets
 from utils.process_articles import download_article
 from utils.process_mp4 import download_mp4
+from utils.process_quizzes import download_quiz
 
 console = Console()
 
@@ -65,9 +66,9 @@ class Udemy:
             logger.critical("Unable to retrieve a valid course ID from the provided course URL. Please check the course URL or try with --id")
             sys.exit(1)
         
-    def fetch_course(self, course_id):
+    def fetch_course(self, course_id, portal_name):
         try:
-            response = self.request(COURSE_URL.format(course_id=course_id)).json()
+            response = self.request(COURSE_URL.format(portal_name=portal_name, course_id=course_id)).json()
     
             if response.get('detail') == 'Not found.':
                 logger.critical("The course could not be found with the provided ID or URL. Please verify the course ID/URL and ensure that it is publicly accessible or you have the necessary permissions.")
@@ -78,9 +79,9 @@ class Udemy:
             logger.critical(f"Unable to retrieve the course details: {e}")
             sys.exit(1)
     
-    def fetch_course_curriculum(self, course_id):
+    def fetch_course_curriculum(self, course_id, portal_name):
         all_results = []
-        url = CURRICULUM_URL.format(course_id=course_id)
+        url = CURRICULUM_URL.format(portal_name=portal_name, course_id=course_id)
         total_count = 0
 
         logger.info("Fetching course curriculum. This may take a while")
@@ -166,9 +167,9 @@ class Udemy:
                 if 'children' in item:
                     self.build_curriculum_tree(item['children'], node, index=1)
 
-    def fetch_lecture_info(self, course_id, lecture_id):
+    def fetch_lecture_info(self, course_id, lecture_id, portal_name):
         try:
-            return self.request(LECTURE_URL.format(course_id=course_id, lecture_id=lecture_id)).json()
+            return self.request(LECTURE_URL.format(portal_name=portal_name, course_id=course_id, lecture_id=lecture_id)).json()
         except Exception as e:
             logger.critical(f"Failed to fetch lecture info: {e}")
             sys.exit(1)
@@ -182,12 +183,12 @@ class Udemy:
             logger.error(f"Failed to create directory \"{path}\": {e}")
             sys.exit(1)
 
-    def download_lecture(self, course_id, lecture, lect_info, temp_folder_path, lindex, folder_path, task_id, progress):
+    def download_lecture(self, course_id, lecture, lect_info, temp_folder_path, lindex, folder_path, task_id, progress, portal_name):
         if not skip_captions and len(lect_info["asset"]["captions"]) > 0:
-            download_captions(lect_info["asset"]["captions"], folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", captions, convert_to_srt)
+            download_captions(lect_info["asset"]["captions"], folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", captions, convert_to_srt, portal_name)
 
         if not skip_assets and len(lecture["supplementary_assets"]) > 0:
-            download_supplementary_assets(self, lecture["supplementary_assets"], folder_path, course_id, lect_info["id"])
+            download_supplementary_assets(self, lecture["supplementary_assets"], folder_path, course_id, lect_info["id"], portal_name)
 
         if not skip_lectures and lect_info['asset']['asset_type'] == "Video":
             mpd_url = next((item['src'] for item in lect_info['asset']['media_sources'] if item['type'] == "application/dash+xml"), None)
@@ -199,22 +200,24 @@ class Udemy:
                     if mp4_url is None:
                         logger.error(f"This lecture appears to be served in different format. We currently do not support downloading this format. Please create an issue on GitHub if you need this feature.")
                     else:
-                        download_mp4(mp4_url, temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress)
+                        download_mp4(mp4_url, temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress, portal_name)
                 else:
-                    download_and_merge_m3u8(m3u8_url, temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress)
+                    download_and_merge_m3u8(m3u8_url, temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress, portal_name)
             else:
                 if key is None:
                     logger.warning("The video appears to be DRM-protected, and it may not play without a valid Widevine decryption key.")
                 download_and_merge_mpd(mpd_url, temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", lecture['asset']['time_estimation'], key, task_id, progress)
         elif not skip_articles and lect_info['asset']['asset_type'] == "Article":
-            download_article(self, lect_info['asset'], temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress)
+            download_article(self, lect_info['asset'], temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress, portal_name)
+        elif not skip_quizzes and lect_info['asset']['asset_type'] == "Quiz":
+            download_quiz(self, lect_info['asset'], temp_folder_path, f"{lindex}. {sanitize_filename(lecture['title'])}", task_id, progress, portal_name)
 
         try:
             progress.remove_task(task_id)
         except KeyError:
             pass
 
-    def download_course(self, course_id, curriculum):
+    def download_course(self, course_id, curriculum, portal_name):
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -244,7 +247,7 @@ class Udemy:
                     folder_path = os.path.join(COURSE_DIR, f"{mindex}. {remove_emojis_and_binary(sanitize_filename(chapter['title']))}")
                     temp_folder_path = os.path.join(folder_path, str(lecture['id']))
                     self.create_directory(temp_folder_path)
-                    lect_info = self.fetch_lecture_info(course_id, lecture['id'])
+                    lect_info = self.fetch_lecture_info(course_id, lecture['id'], portal_name)
                     
                     task_id = progress.add_task(
                         f"Downloading Lecture: {lecture['title']} ({lindex}/{len(chapter['children'])})", 
@@ -253,7 +256,7 @@ class Udemy:
                     tasks[task_id] = (lecture, lect_info, temp_folder_path, lindex, folder_path)
                     
                     future = executor.submit(
-                        self.download_lecture, course_id, lecture, lect_info, temp_folder_path, lindex, folder_path, task_id, progress
+                        self.download_lecture, course_id, lecture, lect_info, temp_folder_path, lindex, folder_path, task_id, progress, portal_name
                     )
 
                     futures.append((task_id, future))
@@ -275,7 +278,7 @@ class Udemy:
                         folder_path = os.path.join(COURSE_DIR, f"{mindex}. {sanitize_filename(chapter['title'])}")
                         temp_folder_path = os.path.join(folder_path, str(lecture['id']))
                         self.create_directory(temp_folder_path)
-                        lect_info = self.fetch_lecture_info(course_id, lecture['id'])
+                        lect_info = self.fetch_lecture_info(course_id, lecture['id'], portal_name)
 
                         task_id = progress.add_task(
                             f"Downloading Lecture: {lecture['title']} ({lindex}/{len(chapter['children'])})",
@@ -284,7 +287,7 @@ class Udemy:
                         tasks[task_id] = (lecture, lect_info, temp_folder_path, lindex, folder_path)
 
                         future = executor.submit(
-                            self.download_lecture, course_id, lecture, lect_info, temp_folder_path, lindex, folder_path, task_id, progress
+                            self.download_lecture, course_id, lecture, lect_info, temp_folder_path, lindex, folder_path, task_id, progress, portal_name
                         )
 
                         futures.append((task_id, future))
@@ -400,7 +403,9 @@ def main():
         skip_articles = args.skip_articles
         skip_assignments = args.skip_assignments
 
-        course_info = udemy.fetch_course(course_id)
+        portal_name = re.search(r'https://(.*?).udemy.com', course_url).group(1)
+
+        course_info = udemy.fetch_course(course_id, portal_name)
         COURSE_DIR = os.path.join(DOWNLOAD_DIR, remove_emojis_and_binary(sanitize_filename(course_info['title'])))
 
         logger.info(f"Course Title: {course_info['title']}")
@@ -431,7 +436,7 @@ def main():
                 sys.exit(1)
         else:
             try:
-                course_curriculum = udemy.fetch_course_curriculum(course_id)
+                course_curriculum = udemy.fetch_course_curriculum(course_id, portal_name)
             except Exception as e:
                 logger.critical(f"Unable to retrieve the course curriculum. {e}")
                 sys.exit(1)
@@ -499,7 +504,7 @@ def main():
         logger.info("The course download is starting. Please wait while the materials are being downloaded.")
 
         start_time = time.time()
-        udemy.download_course(course_id, course_curriculum)
+        udemy.download_course(course_id, course_curriculum, portal_name)
         end_time = time.time()
 
         elapsed_time = end_time - start_time
